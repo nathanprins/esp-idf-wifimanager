@@ -8,6 +8,7 @@
 #include <nvs_flash.h>
 #include <nvs.h>
 #include <esp_err.h>
+#include "libs/mongoose/mongoose.h"
 
 #define WM_TAG "WiFiManager"
 
@@ -16,30 +17,50 @@
 #define WM_CONN_BIT BIT0
 
 typedef struct wm {
-  wifi_config_t config;
+  wifi_config_t ap_config;
+  wifi_config_t sta_config;
   wifi_mode_t mode;
   EventGroupHandle_t wifi_event_group;
+  struct mg_mgr mgr;
+  struct mg_connection* nc;
+  char port[5];
+  uint8_t initialized;
 } wm_t;
 
 typedef enum wm_state {
   WM_OK,
   WM_ERR,
+  WM_UNINITIALIZED,
   WM_NO_STA_SSID,
   WM_NO_AP_SSID,
   WM_MODE_NOT_SET,
-  WM_MODE_UNSUPPORTED
+  WM_MODE_UNSUPPORTED,
+  WM_NVS_INIT_ERROR,
+  WM_EVENT_LOOP_ERROR,
+  WM_WIFI_INIT_ERROR,
+  WM_CONFIG_ERROR,
+  WM_WIFI_START_ERROR,
+  WM_LISTENER_ERROR
 } wm_state_t;
 
-#define ESP2EXIT(COND, ERR) (COND == ESP_OK ? return ERR : NULL)
+#define ESP2EXIT(COND, ERR) if(COND != ESP_OK){ return ERR; }
 
 wm_state_t wm_init(wm_t* wm);
 
 wm_state_t wm_start(wm_t* wm);
 
+wm_state_t wm_loop(wm_t* wm);
+
 wm_state_t wm_print_info(wm_t* wm);
 
-wm_state_t wm_set_config(wm_t* wm, wifi_config_t* config);
+char* wm_state_to_char(wm_state_t state);
 
-wm_state_t wm_set_ap_login(wm_t* wm, char* ssid, char* password);
+wm_state_t wm_set_port(wm_t* wm, char* port);
 
-wm_state_t wm_set_sta_login(wm_t* wm, char* ssid, char* password);
+wm_state_t wm_ap_set_config(wm_t* wm, wifi_config_t* ap_config);
+
+wm_state_t wm_sta_set_config(wm_t* wm, wifi_config_t* ap_config);
+
+wm_state_t wm_ap_set_login(wm_t* wm, char* ssid, char* password);
+
+wm_state_t wm_sta_set_login(wm_t* wm, char* ssid, char* password);
