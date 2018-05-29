@@ -1,4 +1,5 @@
 #include "wifimanager.h"
+#include "frontend/webapp.h"
 
 char* wm_state_to_char(wm_state_t state){
   switch (state) {
@@ -15,21 +16,35 @@ char* wm_state_to_char(wm_state_t state){
     case WM_CONFIG_ERROR: return "WM_CONFIG_ERROR";
     case WM_WIFI_START_ERROR: return "WM_WIFI_START_ERROR";
     case WM_LISTENER_ERROR: return "WM_LISTENER_ERROR";
+    case WM_MG_CALLBACK_USERDATA_DISABLED: return "WM_MG_CALLBACK_USERDATA_DISABLED";
+    case WM_SCAN_ERROR: return "WM_SCAN_ERROR";
     default: return "WM_UNKNOWN_ERROR";
   }
 }
+
+static wm_state_t wm_wifi_scan(wm_t* wm, uint8_t blocking);
 
 static esp_err_t wm_event_handler(void *ctx, system_event_t *event){
   wm_t* wm = (wm_t*)ctx;
   switch(event->event_id) {
       case SYSTEM_EVENT_STA_START:
-        esp_wifi_connect();
+        if(wm->mode == WIFI_MODE_APSTA){
+          wm_wifi_scan(wm, 0 /* Non-blocking */);
+        }else{
+          esp_wifi_connect();
+        }
         break;
+      case SYSTEM_EVENT_STA_CONNECTED:
+        wm->wifi_connected = 1;
       case SYSTEM_EVENT_STA_GOT_IP:
         printf("got ip:%s \n", ip4addr_ntoa(&event->event_info.got_ip.ip_info.ip));
+        strcpy(wm->ip, ip4addr_ntoa(&event->event_info.got_ip.ip_info.ip));
+        printf("saved ip:%s \n", wm->ip);
+        wm->wifi_has_ip = 1;
         xEventGroupSetBits(wm->wifi_event_group, WM_CONN_BIT);
         break;
       case SYSTEM_EVENT_STA_DISCONNECTED:
+        wm->wifi_connected = 0;
         esp_wifi_connect();
         xEventGroupClearBits(wm->wifi_event_group, WM_CONN_BIT);
         break;
@@ -39,28 +54,37 @@ static esp_err_t wm_event_handler(void *ctx, system_event_t *event){
       case SYSTEM_EVENT_AP_STADISCONNECTED:
         // ESP_LOGI(WM_TAG, "station:"MACSTR"leave, AID=%d", MAC2STR(event->event_info.sta_disconnected.mac), event->event_info.sta_disconnected.aid);
         break;
+      case SYSTEM_EVENT_SCAN_DONE:
+        wm->scan_state = WM_SCAN_STATE_DONE;
+        wm->scan_num_found = event->event_info.scan_done.number;
+        free(wm->scan_result);
+        wm->scan_result = malloc(sizeof(wifi_ap_record_t) * wm->scan_num_found);
+        esp_wifi_scan_get_ap_records(&wm->scan_num_found, wm->scan_result);
+        break;
       default:
         break;
     }
     return ESP_OK;
 }
 
-static void wm_strcpy(uint8_t* dest, char* src, uint8_t rlen){
-  if(rlen != 0)
-    memset(dest, 0, rlen);
-  memcpy(dest, src, strlen(src) + 1);
-}
-
 wm_state_t wm_init(wm_t* wm){
+  #if !MG_ENABLE_CALLBACK_USERDATA
+    return WM_MG_CALLBACK_USERDATA_DISABLED;
+  #endif
+
   wm->initialized = 0;
+  wm->wifi_connected = 0;
+  wm->mode_update = 0;
+  wm->wifi_has_ip = 0;
+  wm->scan_num_found = 0;
+  wm->scan_state = WM_SCAN_STATE_NOTSCANNED;
 
-  esp_err_t err = nvs_flash_init();
+  memset(wm->ip, 0, 16);
 
-  if (err == ESP_ERR_NVS_NO_FREE_PAGES) {
+  if (nvs_flash_init() == ESP_ERR_NVS_NO_FREE_PAGES) {
     nvs_flash_erase();
-    err = nvs_flash_init();
+    ESP2EXIT(nvs_flash_init(), WM_NVS_INIT_ERROR);
   }
-  ESP2EXIT(err, WM_NVS_INIT_ERROR);
 
   wm->wifi_event_group = xEventGroupCreate();
   tcpip_adapter_init();
@@ -84,65 +108,171 @@ wm_state_t wm_init(wm_t* wm){
 }
 
 static wm_state_t wm_save_config(wm_t* wm){
-  switch (wm->mode) {
-    case WIFI_MODE_STA:
-      ESP2EXIT(esp_wifi_set_config(WIFI_IF_STA, &wm->sta_config), WM_CONFIG_ERROR);
-      return WM_OK;
-    case WIFI_MODE_APSTA:
-      ESP2EXIT(esp_wifi_set_config(WIFI_IF_AP, &wm->ap_config), WM_CONFIG_ERROR);
-      ESP2EXIT(esp_wifi_set_config(WIFI_IF_STA, &wm->sta_config), WM_CONFIG_ERROR);
-      return WM_OK;
-    case WIFI_MODE_NULL:
-      return WM_MODE_NOT_SET;
-    default:
-      return WM_MODE_UNSUPPORTED;
+  ESP2EXIT(esp_wifi_set_config(WIFI_IF_STA, &wm->sta_config), WM_CONFIG_ERROR);
+  if(wm->mode == WIFI_MODE_APSTA)
+    ESP2EXIT(esp_wifi_set_config(WIFI_IF_AP, &wm->ap_config), WM_CONFIG_ERROR);
+  return WM_OK;
+}
+
+static wm_state_t wm_wifi_scan(wm_t* wm, uint8_t blocking){
+  if(wm->scan_state != WM_SCAN_STATE_ACTIVE){
+    wm->scan_state = WM_SCAN_STATE_ACTIVE;
+    wifi_scan_config_t scan_conf = {
+      .ssid = NULL,
+      .bssid = NULL,
+      .channel = 0,
+      .show_hidden = 0
+    };
+    ESP2EXIT(esp_wifi_scan_start(&scan_conf, blocking), WM_SCAN_ERROR);
   }
+  return WM_OK;
 }
 
-static void wm_endpoint_home(struct mg_connection *nc, int ev, void* ev_data){
-  (void) ev; (void) ev_data;
-
-  mg_printf(nc, "HTTP/1.0 200 OK\r\n\r\n<h1>/</h1>");
-
-  nc->flags |= MG_F_SEND_AND_CLOSE;
+static int wm_is_equal(const struct mg_str *s1, const char *s2) {
+  const struct mg_str _s2 = { s2, strlen(s2) };
+  return s1->len == _s2.len && memcmp(s1->p, _s2.p, _s2.len) == 0;
 }
 
-static void wm_endpoint_connect(struct mg_connection *nc, int ev, void* ev_data){
-  (void) ev; (void) ev_data;
+static int wm_is_request(struct http_message *hm, const char* uri, const char* method){
+  return (wm_is_equal(&hm->uri, uri) && wm_is_equal(&hm->method, method));
+}
 
-  mg_printf(nc, "HTTP/1.0 200 OK\r\n\r\n<h1>/connect</h1>");
+static char* wm_get_query_value (char *query, char *name, uint8_t urldecode) {
+    int r_len = 0, cur_c = 0, nam_c = 0, v_skip = 0;
+    uint8_t match = 0;
+    char* value;
+    while(query[cur_c]){
+        match = 1;
+        char q_char = query[cur_c + nam_c];
+        // While (name isn't terminated OR (query isn't terminated AND char isn't '&' and '=')) AND still a match
+        while((name[nam_c] || (q_char != '=' && q_char != '&' && q_char)) && match){
+            if(name[nam_c] != q_char) match = 0;
+            nam_c++;
+            q_char = query[cur_c + nam_c];
+        }
+        nam_c--; // Overshot by 1
+        if(match){
+            if(query[cur_c + nam_c + 1] != '=') return NULL;
 
-  nc->flags |= MG_F_SEND_AND_CLOSE;
+            char v_char = query[cur_c + nam_c + 2 + r_len];
+            while(v_char && v_char != '&'){
+                if(urldecode && v_char == '%'){
+                    r_len += 3;
+                    v_skip += 2;
+                }else{
+                    r_len++;
+                }
+
+                v_char = query[cur_c + nam_c + 2 + r_len];
+            }
+            if(r_len == 0) return NULL;
+
+            value = calloc(r_len - v_skip + 1, sizeof(char));
+            if(urldecode){
+              mg_url_decode(&query[cur_c + nam_c + 2], r_len, value, r_len - v_skip + 1, 1);
+            }else{
+              memcpy(value, &query[cur_c + nam_c + 2], r_len - v_skip);
+            }
+            return value;
+        }
+
+        nam_c = 0;
+        cur_c++;
+    }
+    return NULL;
 }
 
 static void wm_mg_handler(struct mg_connection *nc, int ev, void *p) {
-  static const char *reply_fmt =
-      "HTTP/1.0 200 OK\r\n"
-      "Connection: close\r\n"
-      "Content-Type: text/plain\r\n"
-      "\r\n"
-      "Hello %s\n";
-
+  wm_t* wm = (wm_t*) nc->user_data;
   switch (ev) {
     case MG_EV_ACCEPT: {
+      // Used for debugging connections
       char addr[32];
-      mg_sock_addr_to_str(&nc->sa, addr, sizeof(addr),
-                          MG_SOCK_STRINGIFY_IP | MG_SOCK_STRINGIFY_PORT);
+      mg_sock_addr_to_str(&nc->sa, addr, sizeof(addr), MG_SOCK_STRINGIFY_IP | MG_SOCK_STRINGIFY_PORT);
       printf("Connection %p from %s\n", nc, addr);
       break;
     }
     case MG_EV_HTTP_REQUEST: {
-      char addr[32];
+      // Parse request
       struct http_message *hm = (struct http_message *) p;
-      mg_sock_addr_to_str(&nc->sa, addr, sizeof(addr),
-                          MG_SOCK_STRINGIFY_IP | MG_SOCK_STRINGIFY_PORT);
-      printf("HTTP request from %s: %.*s %.*s\n", addr, (int) hm->method.len,
-             hm->method.p, (int) hm->uri.len, hm->uri.p);
-      mg_printf(nc, reply_fmt, addr);
+
+      if(wm_is_request(hm, "/", "GET"))
+      {
+        printf("Home\n");
+        mg_printf(nc, "HTTP/1.0 200 OK\r\n\r\n%.*s", min_html_len, min_html);
+      }
+      if(wm_is_request(hm, "/api/wifi", "GET"))
+      {
+        mg_send_response_line(nc, 200, "Content-Type: application/json");
+        mg_printf(nc, "\r\n{");
+          mg_printf(nc, "\"mode\":\"%s\",", (wm->mode == WIFI_MODE_APSTA) ? "apsta" : "sta");
+          mg_printf(nc, "\"sta\":{");
+            mg_printf(nc, "\"connected\":%s,", BOOLTOCHAR(wm->wifi_connected));
+            mg_printf(nc, "\"has_ip\":%s", BOOLTOCHAR(wm->wifi_has_ip));
+            if(wm->wifi_has_ip)
+              mg_printf(nc, ",\"ip\":\"%s\"", wm->ip);
+            if(!wm->wifi_connected){
+              mg_printf(nc, ",\"scanState\":%d,", wm->scan_state);
+              mg_printf(nc, "\"scanNumFound\":%d,", wm->scan_num_found);
+              mg_printf(nc, "\"scanResults\":[");
+              for(int i = 0; i < wm->scan_num_found; i++)
+                mg_printf(nc, "{\"name\":\"%s\",\"rssi\":%d}%s", (char*)wm->scan_result[i].ssid, wm->scan_result[i].rssi, (i < wm->scan_num_found - 1) ? "," : "");
+              mg_printf(nc, "]");
+            }
+          mg_printf(nc, "}");
+        mg_printf(nc, "}");
+      }
+      else
+      if(wm_is_request(hm, "/api/wifi/sta", "POST"))
+      {
+        mg_send_response_line(nc, 200, "Content-Type: application/json");
+        char* body = calloc(hm->body.len + 1, sizeof(char));
+        memcpy(body, hm->body.p, hm->body.len);
+
+        char* d_ssid = wm_get_query_value(body, "ssid", 1);
+        char* d_pass = wm_get_query_value(body, "password", 1);
+
+        printf("Received creds: %s/%s \n\r", d_ssid, d_pass);
+
+        if(d_ssid){
+          memcpy(wm->sta_config.sta.ssid, d_ssid, strlen(d_ssid) + 1);
+          if(d_pass)
+            memcpy(wm->sta_config.sta.password, d_pass, strlen(d_pass) + 1);
+          wm_save_config(wm);
+          esp_wifi_connect();
+          mg_printf(nc, "\r\n{\"connecting\":1}");
+        }else{
+          mg_printf(nc, "\r\n{\"connecting\":0}");
+        }
+        free(d_ssid); free(d_pass);
+        free(body);
+      }
+      else
+      if(wm_is_request(hm, "/api/wifi/mode", "POST"))
+      {
+        mg_send_response_line(nc, 200, "Content-Type: application/json");
+        char* body = calloc(hm->body.len + 1, sizeof(char));
+        memcpy(body, hm->body.p, hm->body.len);
+
+        char* d_mode = wm_get_query_value(body, "mode", 1);
+
+        printf("Received mode: %s \n\r", d_mode);
+
+        if(d_mode){
+          mg_printf(nc, "\r\n{\"success\":1}");
+          wm->mode = (strcmp(d_mode, "apsta") == 0) ? WIFI_MODE_APSTA : WIFI_MODE_STA;
+          wm->mode_update = 5;
+        }else{
+          mg_printf(nc, "\r\n{\"success\":0}");
+        }
+        free(d_mode);
+        free(body);
+      }
       nc->flags |= MG_F_SEND_AND_CLOSE;
       break;
     }
     case MG_EV_CLOSE: {
+      // Used for debugging connections
       printf("Connection %p closed\n", nc);
       break;
     }
@@ -159,29 +289,25 @@ wm_state_t wm_start(wm_t* wm){
   ESP2EXIT(esp_wifi_start(), WM_WIFI_START_ERROR);
 
   mg_mgr_init(&wm->mgr, NULL);
-  wm->nc = mg_bind(&wm->mgr, wm->port, wm_mg_handler);
+  wm->nc = mg_bind(&wm->mgr, wm->port, MG_CB(WM2CB(wm_mg_handler), wm));
 
   if(wm->nc == NULL)
     return WM_LISTENER_ERROR;
 
-  switch (wm->mode) {
-    case WIFI_MODE_APSTA:
-      mg_register_http_endpoint(wm->nc, "/", wm_endpoint_home);
-      mg_register_http_endpoint(wm->nc, "/connect", wm_endpoint_connect);
-      break;
-    case WIFI_MODE_STA:
-      mg_register_http_endpoint(wm->nc, "/", wm_endpoint_home);
-      break;
-    default:
-      break;
-  }
   mg_set_protocol_http_websocket(wm->nc);
 
   return WM_OK;
 }
 
-wm_state_t wm_loop(wm_t* wm){
-  mg_mgr_poll(&wm->mgr, 1000);
+wm_state_t wm_loop(wm_t* wm, int milli){
+  mg_mgr_poll(&wm->mgr, milli);
+
+  // Multiple loops required in order to be sure all connections are closed before shutting down the softAP
+  if(wm->mode_update > 1) wm->mode_update--;
+  if(wm->mode_update == 1){
+    esp_wifi_set_mode(wm->mode);
+    wm->mode_update = 0;
+  }
   return WM_OK;
 }
 
@@ -214,9 +340,10 @@ wm_state_t wm_ap_set_login(wm_t* wm, char* ssid, char* password){
   if(ssid == NULL)
     return WM_NO_AP_SSID;
 
-  wm_strcpy(wm->ap_config.ap.ssid, ssid, WM_SSID_LEN);
+  strcpy(WM2CHAR(wm->ap_config.ap.ssid), ssid);
+  wm->ap_config.ap.ssid_len = strlen(WM2CCHAR(ssid));
   if(password != NULL){
-    wm_strcpy(wm->ap_config.ap.password, password, WM_PASSWORD_LEN);
+    strcpy(WM2CHAR(wm->ap_config.ap.password), password);
     wm->ap_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
   }
 
@@ -227,9 +354,9 @@ wm_state_t wm_sta_set_login(wm_t* wm, char* ssid, char* password){
   if(ssid == NULL)
     return WM_NO_STA_SSID;
 
-  wm_strcpy(wm->sta_config.sta.ssid, ssid, WM_SSID_LEN);
+  strcpy(WM2CHAR(wm->sta_config.sta.ssid), ssid);
   if(password != NULL)
-    wm_strcpy(wm->sta_config.sta.password, password, WM_PASSWORD_LEN);
+    strcpy(WM2CHAR(wm->sta_config.sta.password), password);
 
   return WM_OK;
 }
