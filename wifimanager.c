@@ -1,15 +1,16 @@
 #include "wifimanager.h"
-#include "frontend/webapp.h"
 
 char* wm_state_to_char(wm_state_t state){
   switch (state) {
     case WM_OK: return "WM_OK";
     case WM_ERR: return "WM_ERR";
+    case WM_UNINITIALIZED: return "WM_UNINITIALIZED";
+    case WM_NOT_STARTED: return "WM_NOT_STARTED";
+    case WM_STARTED: return "WM_STARTED";
     case WM_NO_STA_SSID: return "WM_NO_STA_SSID";
     case WM_NO_AP_SSID: return "WM_NO_AP_SSID";
     case WM_MODE_NOT_SET: return "WM_MODE_NOT_SET";
     case WM_MODE_UNSUPPORTED: return "WM_MODE_UNSUPPORTED";
-    case WM_UNINITIALIZED: return "WM_UNINITIALIZED";
     case WM_NVS_INIT_ERROR: return "WM_NVS_INIT_ERROR";
     case WM_EVENT_LOOP_ERROR: return "WM_EVENT_LOOP_ERROR";
     case WM_WIFI_INIT_ERROR: return "WM_WIFI_INIT_ERROR";
@@ -18,6 +19,7 @@ char* wm_state_to_char(wm_state_t state){
     case WM_LISTENER_ERROR: return "WM_LISTENER_ERROR";
     case WM_MG_CALLBACK_USERDATA_DISABLED: return "WM_MG_CALLBACK_USERDATA_DISABLED";
     case WM_SCAN_ERROR: return "WM_SCAN_ERROR";
+    case WM_BAD_HTML: return "WM_BAD_HTML";
     default: return "WM_UNKNOWN_ERROR";
   }
 }
@@ -73,11 +75,14 @@ wm_state_t wm_init(wm_t* wm){
   #endif
 
   wm->initialized = 0;
+  wm->started = 0;
   wm->wifi_connected = 0;
   wm->mode_update = 0;
   wm->wifi_has_ip = 0;
   wm->scan_num_found = 0;
   wm->scan_state = WM_SCAN_STATE_NOTSCANNED;
+  wm->html = NULL;
+  wm->html_len = 0;
 
   memset(wm->ip, 0, 16);
 
@@ -196,10 +201,10 @@ static void wm_mg_handler(struct mg_connection *nc, int ev, void *p) {
       // Parse request
       struct http_message *hm = (struct http_message *) p;
 
-      if(wm_is_request(hm, "/", "GET"))
+      if(wm_is_request(hm, "/", "GET") && wm->html_len)
       {
         printf("Home\n");
-        mg_printf(nc, "HTTP/1.0 200 OK\r\n\r\n%.*s", min_html_len, min_html);
+        mg_printf(nc, "HTTP/1.0 200 OK\r\n\r\n%.*s", wm->html_len, wm->html);
       }
       if(wm_is_request(hm, "/api/wifi", "GET"))
       {
@@ -282,9 +287,11 @@ static void wm_mg_handler(struct mg_connection *nc, int ev, void *p) {
 wm_state_t wm_start(wm_t* wm){
   if(wm->initialized == 0)
     return WM_UNINITIALIZED;
+  if(wm->started)
+    return WM_STARTED;
 
   wm->mode = wm->sta_config.sta.ssid[0] ? WIFI_MODE_STA : WIFI_MODE_APSTA;
-  esp_wifi_set_mode(wm->mode);
+  ESP2EXIT(esp_wifi_set_mode(wm->mode), WM_ERR);
   wm_save_config(wm);
   ESP2EXIT(esp_wifi_start(), WM_WIFI_START_ERROR);
 
@@ -296,10 +303,14 @@ wm_state_t wm_start(wm_t* wm){
 
   mg_set_protocol_http_websocket(wm->nc);
 
+  wm->started = 1;
   return WM_OK;
 }
 
 wm_state_t wm_loop(wm_t* wm, int milli){
+  if(!wm->started)
+    return WM_NOT_STARTED;
+
   mg_mgr_poll(&wm->mgr, milli);
 
   // Multiple loops required in order to be sure all connections are closed before shutting down the softAP
@@ -308,6 +319,14 @@ wm_state_t wm_loop(wm_t* wm, int milli){
     esp_wifi_set_mode(wm->mode);
     wm->mode_update = 0;
   }
+
+  return WM_OK;
+}
+
+wm_state_t wm_set_html(wm_t* wm, unsigned char* html, int len){
+  if(html == NULL) return WM_BAD_HTML;
+  wm->html = html;
+  wm->html_len = len ? len : strlen((char*)html);
   return WM_OK;
 }
 

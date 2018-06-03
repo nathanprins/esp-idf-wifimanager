@@ -29,6 +29,8 @@ typedef enum wm_state {
   WM_OK,
   WM_ERR,
   WM_UNINITIALIZED,
+  WM_NOT_STARTED,
+  WM_STARTED,
   WM_NO_STA_SSID,
   WM_NO_AP_SSID,
   WM_MODE_NOT_SET,
@@ -40,7 +42,8 @@ typedef enum wm_state {
   WM_WIFI_START_ERROR,
   WM_LISTENER_ERROR,
   WM_MG_CALLBACK_USERDATA_DISABLED,
-  WM_SCAN_ERROR
+  WM_SCAN_ERROR,
+  WM_BAD_HTML
 } wm_state_t;
 
 typedef enum wm_scan_state {
@@ -56,6 +59,8 @@ typedef struct wm {
   uint8_t mode_update;
   uint8_t wifi_connected;
   uint8_t wifi_has_ip;
+  unsigned char* html;
+  int html_len;
   char ip[16];
   EventGroupHandle_t wifi_event_group;
   struct mg_mgr mgr;
@@ -65,6 +70,7 @@ typedef struct wm {
   uint16_t scan_num_found;
   wifi_ap_record_t* scan_result;
   uint8_t initialized;
+  uint8_t started;
 } wm_t;
 
 #define ESP2EXIT(COND, ERR) if(COND != ESP_OK){ return ERR; }
@@ -80,6 +86,8 @@ wm_state_t wm_print_info(wm_t* wm);
 char* wm_state_to_char(wm_state_t state);
 
 wm_state_t wm_set_port(wm_t* wm, char* port);
+
+wm_state_t wm_set_html(wm_t* wm, unsigned char* html, int len);
 
 wm_state_t wm_ap_set_config(wm_t* wm, wifi_config_t* ap_config);
 
