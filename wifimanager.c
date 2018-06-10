@@ -59,7 +59,8 @@ static esp_err_t wm_event_handler(void *ctx, system_event_t *event){
       case SYSTEM_EVENT_SCAN_DONE:
         wm->scan_state = WM_SCAN_STATE_DONE;
         wm->scan_num_found = event->event_info.scan_done.number;
-        free(wm->scan_result);
+//        if(wm->scan_result != NULL)
+//        	free(wm->scan_result); /* FIXME: Figure out why this doesn't work */
         wm->scan_result = malloc(sizeof(wifi_ap_record_t) * wm->scan_num_found);
         esp_wifi_scan_get_ap_records(&wm->scan_num_found, wm->scan_result);
         break;
@@ -74,6 +75,11 @@ wm_state_t wm_init(wm_t* wm){
     return WM_MG_CALLBACK_USERDATA_DISABLED;
   #endif
 
+  if (nvs_flash_init() == ESP_ERR_NVS_NO_FREE_PAGES) {
+	nvs_flash_erase();
+	nvs_flash_init();
+  }
+
   wm->initialized = 0;
   wm->started = 0;
   wm->wifi_connected = 0;
@@ -83,13 +89,9 @@ wm_state_t wm_init(wm_t* wm){
   wm->scan_state = WM_SCAN_STATE_NOTSCANNED;
   wm->html = NULL;
   wm->html_len = 0;
+  wm->user_api_endpoint = NULL;
 
   memset(wm->ip, 0, 16);
-
-  if (nvs_flash_init() == ESP_ERR_NVS_NO_FREE_PAGES) {
-    nvs_flash_erase();
-    ESP2EXIT(nvs_flash_init(), WM_NVS_INIT_ERROR);
-  }
 
   wm->wifi_event_group = xEventGroupCreate();
   tcpip_adapter_init();
@@ -142,7 +144,11 @@ static int wm_is_request(struct http_message *hm, const char* uri, const char* m
   return (wm_is_equal(&hm->uri, uri) && wm_is_equal(&hm->method, method));
 }
 
-static char* wm_get_query_value (char *query, char *name, uint8_t urldecode) {
+static int wm_compare_hm_ep(struct http_message *hm, wm_api_endpoint_t *ep){
+	return (strncmp(hm->uri.p, ep->endpoint, ep->endpoint_len) == 0 && strncmp(hm->method.p, ep->method, ep->method_len) == 0) ;
+}
+
+char* wm_get_query_value (char *query, char *name, uint8_t urldecode) {
     int r_len = 0, cur_c = 0, nam_c = 0, v_skip = 0;
     uint8_t match = 0;
     char* value;
@@ -201,10 +207,22 @@ static void wm_mg_handler(struct mg_connection *nc, int ev, void *p) {
       // Parse request
       struct http_message *hm = (struct http_message *) p;
 
+      wm_api_endpoint_t *ep = wm->user_api_endpoint;
+      while(ep != NULL)
+      {
+    	 if(wm_compare_hm_ep(hm, ep))
+    	 {
+    		 ep->cb(wm, nc, hm, ep->ctx);
+    		 ESP_LOGI(WM_TAG, "Custom API endpoint match: %.*s | %.*s", ep->method_len, ep->method, ep->endpoint_len, ep->endpoint);
+    	 }
+    	 ep = ep->next;
+      }
+
       if(wm_is_request(hm, "/", "GET") && wm->html_len)
       {
         printf("Home\n");
         mg_printf(nc, "HTTP/1.0 200 OK\r\n\r\n%.*s", wm->html_len, wm->html);
+        nc->flags |= MG_F_SEND_AND_CLOSE;
       }
       if(wm_is_request(hm, "/api/wifi", "GET"))
       {
@@ -226,6 +244,7 @@ static void wm_mg_handler(struct mg_connection *nc, int ev, void *p) {
             }
           mg_printf(nc, "}");
         mg_printf(nc, "}");
+        nc->flags |= MG_F_SEND_AND_CLOSE;
       }
       else
       if(wm_is_request(hm, "/api/wifi/sta", "POST"))
@@ -251,6 +270,7 @@ static void wm_mg_handler(struct mg_connection *nc, int ev, void *p) {
         }
         free(d_ssid); free(d_pass);
         free(body);
+        nc->flags |= MG_F_SEND_AND_CLOSE;
       }
       else
       if(wm_is_request(hm, "/api/wifi/mode", "POST"))
@@ -272,8 +292,8 @@ static void wm_mg_handler(struct mg_connection *nc, int ev, void *p) {
         }
         free(d_mode);
         free(body);
+        nc->flags |= MG_F_SEND_AND_CLOSE;
       }
-      nc->flags |= MG_F_SEND_AND_CLOSE;
       break;
     }
     case MG_EV_CLOSE: {
@@ -295,6 +315,8 @@ wm_state_t wm_start(wm_t* wm){
   wm_save_config(wm);
   ESP2EXIT(esp_wifi_start(), WM_WIFI_START_ERROR);
 
+//  xEventGroupWaitBits(wm->wifi_event_group, WM_CONN_BIT, false, true, portMAX_DELAY);
+
   mg_mgr_init(&wm->mgr, NULL);
   wm->nc = mg_bind(&wm->mgr, wm->port, MG_CB(WM2CB(wm_mg_handler), wm));
 
@@ -308,19 +330,68 @@ wm_state_t wm_start(wm_t* wm){
 }
 
 wm_state_t wm_loop(wm_t* wm, int milli){
-  if(!wm->started)
-    return WM_NOT_STARTED;
+	if(!wm->started)
+		return WM_NOT_STARTED;
 
-  mg_mgr_poll(&wm->mgr, milli);
+	mg_mgr_poll(&wm->mgr, milli);
 
-  // Multiple loops required in order to be sure all connections are closed before shutting down the softAP
-  if(wm->mode_update > 1) wm->mode_update--;
-  if(wm->mode_update == 1){
-    esp_wifi_set_mode(wm->mode);
-    wm->mode_update = 0;
-  }
+	// Multiple loops required in order to be sure all connections are closed before shutting down the softAP
+	if(wm->mode_update > 1) wm->mode_update--;
+	if(wm->mode_update == 1){
+		esp_wifi_set_mode(wm->mode);
+		wm->mode_update = 0;
+	}
 
-  return WM_OK;
+	return WM_OK;
+}
+
+static wm_api_endpoint_t* wm_new_endpoint_node(char* endpoint, char* method, wm_api_endpoint_callback api_cb, void *context){
+	wm_api_endpoint_t* temp = malloc(sizeof(wm_api_endpoint_t));
+
+	uint16_t endp_len = strlen(endpoint);
+	temp->endpoint_len = endp_len;
+	temp->endpoint = malloc(endp_len*sizeof(char));
+	memcpy(temp->endpoint, endpoint, endp_len);
+
+	uint16_t meth_len = strlen(method);
+	temp->method_len = meth_len;
+	temp->method = malloc(meth_len*sizeof(char));
+	memcpy(temp->method, method, meth_len);
+
+	temp->next = NULL;
+	temp->ctx = context;
+	temp->cb = api_cb;
+	return temp;
+}
+
+wm_state_t wm_register_api_endpoint(wm_t* wm, char* endpoint, char* method, wm_api_endpoint_callback api_cb, void *context){
+	wm_api_endpoint_t* p, *temp = wm_new_endpoint_node(endpoint, method, api_cb, context);
+	if(wm->user_api_endpoint == NULL)
+	{
+		wm->user_api_endpoint = temp;
+	}
+	else
+	{
+		p = wm->user_api_endpoint;
+		while(p->next != NULL)
+			p = p->next;
+		p->next = temp;
+	}
+	return WM_OK;
+}
+
+wm_state_t wm_list_api_endpoints(wm_t* wm){
+	wm_api_endpoint_t* p = wm->user_api_endpoint;
+	if(p == NULL)
+		ESP_LOGI(WM_TAG, "No registered endpoints");
+	else
+		ESP_LOGI(WM_TAG, "Listing WiFiManager endpoints: ");
+	uint16_t count = 1;
+	while(p != NULL){
+		ESP_LOGI(WM_TAG, "%d: %.*s | %.*s", count++, p->method_len, p->method, p->endpoint_len, p->endpoint);
+		p = p->next;
+	}
+	return WM_OK;
 }
 
 wm_state_t wm_set_html(wm_t* wm, unsigned char* html, int len){

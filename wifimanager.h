@@ -10,7 +10,8 @@
 #include <nvs_flash.h>
 #include <nvs.h>
 #include <esp_err.h>
-#include "../lib/include/mongoose.h"
+#include <esp_log.h>
+#include "mongoose.h"
 
 #define WM_TAG "WiFiManager"
 
@@ -52,6 +53,9 @@ typedef enum wm_scan_state {
   WM_SCAN_STATE_DONE
 } wm_scan_state_t;
 
+typedef struct wm_api_endpoint wm_api_endpoint_t;
+typedef struct wm wm_t;
+
 typedef struct wm {
   wifi_config_t ap_config;
   wifi_config_t sta_config;
@@ -59,42 +63,61 @@ typedef struct wm {
   uint8_t mode_update;
   uint8_t wifi_connected;
   uint8_t wifi_has_ip;
-  unsigned char* html;
+  unsigned char *html;
   int html_len;
   char ip[16];
   EventGroupHandle_t wifi_event_group;
   struct mg_mgr mgr;
-  struct mg_connection* nc;
+  struct mg_connection *nc;
+  wm_api_endpoint_t *user_api_endpoint;
   char port[5];
   wm_scan_state_t scan_state;
   uint16_t scan_num_found;
-  wifi_ap_record_t* scan_result;
+  wifi_ap_record_t *scan_result;
   uint8_t initialized;
   uint8_t started;
-} wm_t;
+};
+
+typedef void (*wm_api_endpoint_callback)(wm_t *wm, struct mg_connection *nc, struct http_message *hm, void *ctx);
+
+typedef struct wm_api_endpoint {
+	char *endpoint;
+	uint16_t endpoint_len;
+	char *method;
+	uint16_t method_len;
+	wm_api_endpoint_callback cb;
+	void *ctx;
+	wm_api_endpoint_t *next;
+};
 
 #define ESP2EXIT(COND, ERR) if(COND != ESP_OK){ return ERR; }
 
-wm_state_t wm_init(wm_t* wm);
+wm_state_t wm_init(wm_t *wm);
 
-wm_state_t wm_start(wm_t* wm);
+wm_state_t wm_start(wm_t *wm);
 
-wm_state_t wm_loop(wm_t* wm, int milli);
+wm_state_t wm_loop(wm_t *wm, int milli);
 
-wm_state_t wm_print_info(wm_t* wm);
+wm_state_t wm_print_info(wm_t *wm);
 
-char* wm_state_to_char(wm_state_t state);
+char *wm_state_to_char(wm_state_t state);
 
-wm_state_t wm_set_port(wm_t* wm, char* port);
+wm_state_t wm_set_port(wm_t *wm, char *port);
 
-wm_state_t wm_set_html(wm_t* wm, unsigned char* html, int len);
+wm_state_t wm_set_html(wm_t *wm, unsigned char *html, int len);
 
-wm_state_t wm_ap_set_config(wm_t* wm, wifi_config_t* ap_config);
+wm_state_t wm_ap_set_config(wm_t *wm, wifi_config_t *ap_config);
 
-wm_state_t wm_sta_set_config(wm_t* wm, wifi_config_t* ap_config);
+wm_state_t wm_sta_set_config(wm_t *wm, wifi_config_t *ap_config);
 
-wm_state_t wm_ap_set_login(wm_t* wm, char* ssid, char* password);
+wm_state_t wm_ap_set_login(wm_t *wm, char *ssid, char *password);
 
-wm_state_t wm_sta_set_login(wm_t* wm, char* ssid, char* password);
+wm_state_t wm_sta_set_login(wm_t *wm, char *ssid, char *password);
+
+wm_state_t wm_register_api_endpoint(wm_t *wm, char *endpoint, char *method, wm_api_endpoint_callback cb, void *context);
+
+wm_state_t wm_list_api_endpoints(wm_t *wm);
+
+char* wm_get_query_value (char *query, char *name, uint8_t urldecode);
 
 #endif
